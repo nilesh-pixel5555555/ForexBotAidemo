@@ -352,13 +352,13 @@ def start_scheduler():
         
         # Schedule signals every hour
         for pair in FOREX_PAIRS:
-            scheduler.add_job(generate_signal, 'cron', minute='0,30', args=[pair])
+            scheduler.add_job(generate_signal, 'cron', minute='0,10', args=[pair])
         
         # Daily report at 9 AM
         scheduler.add_job(daily_report, 'cron', hour=9, minute=0)
         
         # Check trades every 30 min
-        scheduler.add_job(check_trades, 'cron', minute='*/30')
+        scheduler.add_job(check_trades, 'cron', minute='*/10')
         
         scheduler.start()
         logger.info("✅ Scheduler started")
@@ -427,3 +427,4 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"🚀 Starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
+
