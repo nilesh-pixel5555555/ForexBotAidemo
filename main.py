@@ -3,22 +3,23 @@
 import os
 import sys
 import logging
-import asyncio # Added for the fix
+import asyncio
+import time
+import threading
 from datetime import datetime, timedelta
 from flask import Flask, jsonify
 import json
 
 # --- START WINDOWS FIX ---
-# This forces Windows to use a specific event loop policy to prevent "Event loop is closed" errors
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 # --- END WINDOWS FIX ---
 
-# Setup logging first
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app first
+# Initialize Flask app
 app = Flask(__name__)
 
 # Global variables
@@ -32,34 +33,26 @@ bot_stats = {
 trade_history = []
 TRADE_HISTORY_FILE = "forex_trade_history.json"
 
-# Safe imports with error handling
-bot = None
-exchange = None
-scheduler = None
-
+# Credentials
 try:
     from dotenv import load_dotenv
     load_dotenv()
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
     logger.info("✅ Environment loaded")
 except Exception as e:
     logger.warning(f"⚠️ dotenv not available: {e}")
 
-try:
-    from telegram import Bot
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-    
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        logger.info("✅ Telegram bot initialized")
-    else:
-        logger.warning("⚠️ Telegram credentials missing")
-except Exception as e:
-    logger.error(f"❌ Telegram init failed: {e}")
-
+# Initialize Exchange (Global)
+exchange = None
 try:
     import ccxt
-    exchange = ccxt.kraken({'enableRateLimit': True, 'rateLimit': 2000, 'timeout': 30000})
+    # enableRateLimit handles basics, but we add manual sleep in loops for safety
+    exchange = ccxt.kraken({
+        'enableRateLimit': True, 
+        'rateLimit': 2000, 
+        'timeout': 30000
+    })
     logger.info("✅ Exchange initialized")
 except Exception as e:
     logger.error(f"❌ Exchange init failed: {e}")
@@ -76,6 +69,9 @@ except Exception as e:
 # Configuration
 FOREX_PAIRS = [p.strip() for p in os.getenv("FOREX_PAIRS", "EUR/USD,GBP/USD,USD/JPY,AUD/USD,USD/CHF").split(',')]
 bot_stats["monitored_assets"] = FOREX_PAIRS
+
+
+# --- HELPER FUNCTIONS ---
 
 def load_trade_history():
     """Load trade history."""
@@ -96,6 +92,27 @@ def save_trade_history():
             json.dump(trade_history, f, indent=2)
     except Exception as e:
         logger.error(f"Could not save history: {e}")
+
+# --- TELEGRAM FIX: Create fresh bot for every message to avoid Loop Error ---
+async def _send_async(text):
+    from telegram import Bot
+    try:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        # Initialize bot inside the async context
+        async with Bot(token=TELEGRAM_BOT_TOKEN) as bot:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"⚠️ Telegram Send Error: {e}")
+
+def send_telegram_message(message):
+    """Wrapper to run async telegram sending from sync context."""
+    try:
+        asyncio.run(_send_async(message))
+    except Exception as e:
+        logger.error(f"❌ Failed to run telegram async: {e}")
+
+# --- TRADING LOGIC ---
 
 def add_trade(symbol, signal, entry_price, tp1, tp2, sl):
     """Add new trade."""
@@ -120,7 +137,6 @@ def add_trade(symbol, signal, entry_price, tp1, tp2, sl):
         logger.error(f"Error adding trade: {e}")
 
 def calculate_pips(symbol, price1, price2):
-    """Calculate pips."""
     try:
         pip_value = 0.01 if 'JPY' in symbol else 0.0001
         return abs(float(price2) - float(price1)) / pip_value
@@ -128,27 +144,36 @@ def calculate_pips(symbol, price1, price2):
         return 0.0
 
 def fetch_data_safe(symbol, timeframe):
-    """Fetch market data."""
+    """Fetch market data with retries."""
     if not exchange or not pd:
         return None
-        
-    try:
-        if not exchange.markets:
-            exchange.load_markets()
-        market_id = exchange.market(symbol)['id']
-        ohlcv = exchange.fetch_ohlcv(market_id, timeframe, limit=100)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        df['sma9'] = df['close'].rolling(9).mean()
-        df['sma20'] = df['close'].rolling(20).mean()
-        return df.dropna()
-    except Exception as e:
-        logger.error(f"Fetch error for {symbol}: {e}")
-        return None
+    
+    # Retry loop to handle network blips
+    for attempt in range(3):
+        try:
+            if not exchange.markets:
+                exchange.load_markets()
+            
+            market_id = exchange.market(symbol)['id']
+            ohlcv = exchange.fetch_ohlcv(market_id, timeframe, limit=100)
+            
+            if not ohlcv:
+                raise ValueError("Empty data returned")
+
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            df['sma9'] = df['close'].rolling(9).mean()
+            df['sma20'] = df['close'].rolling(20).mean()
+            return df.dropna()
+        except Exception as e:
+            logger.warning(f"Fetch attempt {attempt+1} failed for {symbol}: {e}")
+            time.sleep(2) # Wait before retry
+            
+    logger.error(f"❌ Failed to fetch {symbol} after retries")
+    return None
 
 def calculate_cpr(df_daily):
-    """Calculate pivot points."""
     try:
         if df_daily is None or len(df_daily) < 2:
             return None
@@ -169,17 +194,17 @@ def generate_signal(symbol):
     """Generate trading signal."""
     global bot_stats
     
-    if not bot or not exchange or not pd:
-        logger.warning("Required services not available")
+    if not exchange or not pd:
         return
         
     try:
+        logger.info(f"🔍 Analyzing {symbol}...")
+        
         # Fetch data
         df_4h = fetch_data_safe(symbol, '4h')
         df_1h = fetch_data_safe(symbol, '1h')
         
         if df_4h is None or df_1h is None:
-            logger.warning(f"No data for {symbol}")
             return
             
         # Get daily data for pivots
@@ -206,6 +231,10 @@ def generate_signal(symbol):
             signal = "STRONG SELL"
             emoji = "🔻"
             
+        # Only proceed if we have a signal
+        if "BUY" not in signal and "SELL" not in signal:
+            return 
+
         # Calculate targets
         is_buy = "BUY" in signal
         tp1 = cpr['R1'] if is_buy else cpr['S1']
@@ -215,11 +244,10 @@ def generate_signal(symbol):
         decimals = 3 if 'JPY' in symbol else 5
         
         # Track trade
-        if "BUY" in signal or "SELL" in signal:
-            add_trade(symbol, signal, price, tp1, tp2, sl)
-            tp1_pips = calculate_pips(symbol, price, tp1)
-            tp2_pips = calculate_pips(symbol, price, tp2)
-            sl_pips = calculate_pips(symbol, price, sl)
+        add_trade(symbol, signal, price, tp1, tp2, sl)
+        tp1_pips = calculate_pips(symbol, price, tp1)
+        tp2_pips = calculate_pips(symbol, price, tp2)
+        sl_pips = calculate_pips(symbol, price, sl)
         
         # Build message
         message = (
@@ -232,20 +260,14 @@ def generate_signal(symbol):
             f"<b>Trends:</b>\n"
             f"• 4H: {trend_4h}\n"
             f"• 1H: {trend_1h}\n\n"
+            f"<b>Targets:</b>\n"
+            f"✅ TP1: {tp1:.{decimals}f} (+{tp1_pips:.1f}p)\n"
+            f"🔥 TP2: {tp2:.{decimals}f} (+{tp2_pips:.1f}p)\n"
+            f"🛑 SL: {sl:.{decimals}f} (-{sl_pips:.1f}p)\n\n"
+            f"<i>Forex AI V2.5</i>"
         )
         
-        if "BUY" in signal or "SELL" in signal:
-            message += (
-                f"<b>Targets:</b>\n"
-                f"✅ TP1: {tp1:.{decimals}f} (+{tp1_pips:.1f}p)\n"
-                f"🔥 TP2: {tp2:.{decimals}f} (+{tp2_pips:.1f}p)\n"
-                f"🛑 SL: {sl:.{decimals}f} (-{sl_pips:.1f}p)\n\n"
-            )
-            
-        message += "<i>Forex AI V2.5</i>"
-        
-        # Send message
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
+        send_telegram_message(message)
         
         bot_stats['total_analyses'] += 1
         bot_stats['last_analysis'] = datetime.now().isoformat()
@@ -253,9 +275,16 @@ def generate_signal(symbol):
         logger.info(f"✅ Signal sent: {symbol}")
         
     except Exception as e:
-        logger.error(f"Signal generation error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"Signal generation error for {symbol}: {e}")
+
+def run_analysis_cycle():
+    """Runs analysis on ALL pairs sequentially to avoid rate limits."""
+    logger.info("🔄 Starting analysis cycle...")
+    for pair in FOREX_PAIRS:
+        generate_signal(pair)
+        # RATE LIMIT FIX: Wait 5 seconds between pairs
+        time.sleep(5) 
+    logger.info("✅ Analysis cycle complete.")
 
 def check_trades():
     """Check trade outcomes."""
@@ -268,38 +297,41 @@ def check_trades():
                 df = fetch_data_safe(trade['symbol'], '1h')
                 if df is None:
                     continue
+                
+                # Rate limit safety for trade check loop
+                time.sleep(2) 
                     
                 current = float(df.iloc[-1]['close'])
                 entry = float(trade['entry_price'])
                 is_buy = "BUY" in trade['signal']
                 
+                new_status = None
+                
                 if is_buy:
                     if current >= float(trade['tp2']):
-                        trade['status'] = 'TP2_HIT'
-                        trade['outcome'] = 'WIN'
-                        trade['profit_loss_pips'] = calculate_pips(trade['symbol'], entry, trade['tp2'])
+                        new_status = 'TP2_HIT'; trade['outcome'] = 'WIN'
                     elif current >= float(trade['tp1']):
-                        trade['status'] = 'TP1_HIT'
-                        trade['outcome'] = 'PARTIAL_WIN'
-                        trade['profit_loss_pips'] = calculate_pips(trade['symbol'], entry, trade['tp1'])
+                        new_status = 'TP1_HIT'; trade['outcome'] = 'PARTIAL_WIN'
                     elif current <= float(trade['sl']):
-                        trade['status'] = 'SL_HIT'
-                        trade['outcome'] = 'LOSS'
-                        trade['profit_loss_pips'] = -calculate_pips(trade['symbol'], entry, trade['sl'])
+                        new_status = 'SL_HIT'; trade['outcome'] = 'LOSS'
                 else:
                     if current <= float(trade['tp2']):
-                        trade['status'] = 'TP2_HIT'
-                        trade['outcome'] = 'WIN'
-                        trade['profit_loss_pips'] = calculate_pips(trade['symbol'], trade['tp2'], entry)
+                        new_status = 'TP2_HIT'; trade['outcome'] = 'WIN'
                     elif current <= float(trade['tp1']):
-                        trade['status'] = 'TP1_HIT'
-                        trade['outcome'] = 'PARTIAL_WIN'
-                        trade['profit_loss_pips'] = calculate_pips(trade['symbol'], trade['tp1'], entry)
+                        new_status = 'TP1_HIT'; trade['outcome'] = 'PARTIAL_WIN'
                     elif current >= float(trade['sl']):
-                        trade['status'] = 'SL_HIT'
-                        trade['outcome'] = 'LOSS'
-                        trade['profit_loss_pips'] = -calculate_pips(trade['symbol'], trade['sl'], entry)
+                        new_status = 'SL_HIT'; trade['outcome'] = 'LOSS'
                         
+                if new_status:
+                    trade['status'] = new_status
+                    pips = calculate_pips(trade['symbol'], entry, current)
+                    if trade['outcome'] == 'LOSS': pips = -pips
+                    trade['profit_loss_pips'] = pips
+                    
+                    # Notify update
+                    msg = f"🔔 <b>UPDATE:</b> {trade['symbol']} hit {new_status} ({trade['outcome']})"
+                    send_telegram_message(msg)
+                    
             except Exception as e:
                 logger.error(f"Error checking trade: {e}")
     
@@ -307,9 +339,6 @@ def check_trades():
 
 def daily_report():
     """Send daily report."""
-    if not bot:
-        return
-        
     try:
         check_trades()
         
@@ -334,7 +363,7 @@ def daily_report():
                 f"Net: {'🟢' if total_pips >= 0 else '🔴'} {total_pips:+.1f} pips"
             )
         
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
+        send_telegram_message(message)
         logger.info("✅ Report sent")
         
     except Exception as e:
@@ -342,30 +371,26 @@ def daily_report():
 
 def start_scheduler():
     """Start background scheduler."""
-    global scheduler
-    
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
-        import threading
         
         scheduler = BackgroundScheduler()
         
-        # Schedule signals every hour
-        for pair in FOREX_PAIRS:
-            scheduler.add_job(generate_signal, 'cron', minute='0,10', args=[pair])
+        # RATE LIMIT FIX: Run one job that cycles through all pairs
+        # Runs every hour at minute 0 and 30
+        scheduler.add_job(run_analysis_cycle, 'cron', minute='0,30')
         
         # Daily report at 9 AM
         scheduler.add_job(daily_report, 'cron', hour=9, minute=0)
         
-        # Check trades every 30 min
-        scheduler.add_job(check_trades, 'cron', minute='*/10')
+        # Check trades every 15 min (offset from signal gen to avoid overlap)
+        scheduler.add_job(check_trades, 'cron', minute='15,45')
         
         scheduler.start()
         logger.info("✅ Scheduler started")
         
-        # Run initial signals
-        for pair in FOREX_PAIRS:
-            threading.Thread(target=generate_signal, args=(pair,), daemon=True).start()
+        # Run initial cycle in a separate thread to not block startup
+        threading.Thread(target=run_analysis_cycle, daemon=True).start()
             
     except Exception as e:
         logger.error(f"Scheduler error: {e}")
@@ -405,20 +430,6 @@ def home():
 def health():
     return jsonify({"status": "healthy", "time": datetime.now().isoformat()}), 200
 
-@app.route('/stats')
-def stats():
-    wins = len([t for t in trade_history if t.get('outcome') == 'WIN'])
-    losses = len([t for t in trade_history if t.get('outcome') == 'LOSS'])
-    pips = sum([t.get('profit_loss_pips', 0) for t in trade_history if t.get('outcome')])
-    
-    return jsonify({
-        "total_trades": len(trade_history),
-        "wins": wins,
-        "losses": losses,
-        "total_pips": round(pips, 1),
-        "status": bot_stats['status']
-    })
-
 # Initialize on startup
 load_trade_history()
 start_scheduler()
@@ -427,4 +438,3 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"🚀 Starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
-
