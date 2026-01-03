@@ -1,4 +1,4 @@
-# main.py - FOREX AI BOT V2.5 (Bulletproof Edition)
+# main.py - FOREX AI BOT V2.6 (No Partials Edition)
 
 import os
 import sys
@@ -28,7 +28,7 @@ bot_stats = {
     "total_analyses": 0,
     "last_analysis": None,
     "uptime_start": datetime.now().isoformat(),
-    "version": "V2.5 Forex Elite"
+    "version": "V2.6 Forex Elite"
 }
 trade_history = []
 TRADE_HISTORY_FILE = "forex_trade_history.json"
@@ -264,7 +264,7 @@ def generate_signal(symbol):
             f"✅ TP1: {tp1:.{decimals}f} (+{tp1_pips:.1f}p)\n"
             f"🔥 TP2: {tp2:.{decimals}f} (+{tp2_pips:.1f}p)\n"
             f"🛑 SL: {sl:.{decimals}f} (-{sl_pips:.1f}p)\n\n"
-            f"<i>Forex AI V2.5</i>"
+            f"<i>Forex AI V2.6</i>"
         )
         
         send_telegram_message(message)
@@ -311,14 +311,16 @@ def check_trades():
                     if current >= float(trade['tp2']):
                         new_status = 'TP2_HIT'; trade['outcome'] = 'WIN'
                     elif current >= float(trade['tp1']):
-                        new_status = 'TP1_HIT'; trade['outcome'] = 'PARTIAL_WIN'
+                        # MODIFIED: Treat TP1 as a full WIN
+                        new_status = 'TP1_HIT'; trade['outcome'] = 'WIN'
                     elif current <= float(trade['sl']):
                         new_status = 'SL_HIT'; trade['outcome'] = 'LOSS'
                 else:
                     if current <= float(trade['tp2']):
                         new_status = 'TP2_HIT'; trade['outcome'] = 'WIN'
                     elif current <= float(trade['tp1']):
-                        new_status = 'TP1_HIT'; trade['outcome'] = 'PARTIAL_WIN'
+                        # MODIFIED: Treat TP1 as a full WIN
+                        new_status = 'TP1_HIT'; trade['outcome'] = 'WIN'
                     elif current >= float(trade['sl']):
                         new_status = 'SL_HIT'; trade['outcome'] = 'LOSS'
                         
@@ -350,7 +352,7 @@ def daily_report():
             message = "📊 <b>24H REPORT</b>\n\nNo signals in last 24 hours."
         else:
             wins = len([t for t in recent if t.get('outcome') == 'WIN'])
-            partial = len([t for t in recent if t.get('outcome') == 'PARTIAL_WIN'])
+            # REMOVED PARTIAL CALCULATION
             losses = len([t for t in recent if t.get('outcome') == 'LOSS'])
             total_pips = sum([t.get('profit_loss_pips', 0) for t in recent if t.get('outcome')])
             
@@ -358,7 +360,6 @@ def daily_report():
                 f"📊 <b>24H FOREX REPORT</b>\n\n"
                 f"Signals: {len(recent)}\n"
                 f"✅ Wins: {wins}\n"
-                f"⚡ Partial: {partial}\n"
                 f"❌ Losses: {losses}\n"
                 f"Net: {'🟢' if total_pips >= 0 else '🔴'} {total_pips:+.1f} pips"
             )
@@ -378,7 +379,7 @@ def start_scheduler():
         
         # RATE LIMIT FIX: Run one job that cycles through all pairs
         # Runs every hour at minute 0 and 30
-        scheduler.add_job(run_analysis_cycle, 'cron', minute='0,30')
+        scheduler.add_job(run_analysis_cycle, 'cron', hour='*/2', minute='0')
         
         # Daily report at 9 AM
         scheduler.add_job(daily_report, 'cron', hour=9, minute=0)
@@ -401,6 +402,7 @@ def home():
     total = len(trade_history)
     wins = len([t for t in trade_history if t.get('outcome') == 'WIN'])
     losses = len([t for t in trade_history if t.get('outcome') == 'LOSS'])
+    # Partials are now included in wins, so math remains simple
     wr = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
     pips = sum([t.get('profit_loss_pips', 0) for t in trade_history if t.get('outcome')])
     
